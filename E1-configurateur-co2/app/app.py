@@ -13,6 +13,7 @@ le contrat du sujet peut être déposé dans la barre latérale.
 """
 from __future__ import annotations
 
+import inspect
 import io
 import time
 from pathlib import Path
@@ -76,6 +77,119 @@ APP_DIR = Path(__file__).resolve().parent
 MODELE_DEFAUT = APP_DIR / "models" / MODELE_JOBLIB
 
 
+_CHILD_ATTRS = (
+    "best_estimator_",
+    "estimator_",
+    "base_estimator_",
+    "final_estimator_",
+    "regressor_",
+    "classifier_",
+)
+
+
+def _iter_all_estimators(modele: object, seen: set[int] | None = None):
+    if seen is None:
+        seen = set()
+    if modele is None or isinstance(modele, (str, bytes, int, float, bool)):
+        return
+    obj_id = id(modele)
+    if obj_id in seen:
+        return
+    seen.add(obj_id)
+    yield modele
+
+    steps = getattr(modele, "steps", None)
+    if isinstance(steps, (list, tuple)):
+        for item in steps:
+            if isinstance(item, (list, tuple)) and len(item) > 1:
+                yield from _iter_all_estimators(item[1], seen)
+
+    for attr_name in ("transformers_", "transformers", "transformer_list"):
+        items = getattr(modele, attr_name, None)
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                if isinstance(item, (list, tuple)) and len(item) > 1:
+                    yield from _iter_all_estimators(item[1], seen)
+
+    for attr_name in ("estimators_", "estimators"):
+        items = getattr(modele, attr_name, None)
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                est = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else item
+                yield from _iter_all_estimators(est, seen)
+
+    for attr_name in _CHILD_ATTRS:
+        child = getattr(modele, attr_name, None)
+        if child is not None:
+            yield from _iter_all_estimators(child, seen)
+
+    calibrated = getattr(modele, "calibrated_classifiers_", None)
+    if isinstance(calibrated, (list, tuple)):
+        for cal in calibrated:
+            for sub_attr in ("estimator", "base_estimator"):
+                sub = getattr(cal, sub_attr, None)
+                if sub is not None:
+                    yield from _iter_all_estimators(sub, seen)
+
+
+def _harmonize_loaded_model(modele: object) -> object:
+    """Harmonise les attributs manquants entre versions de scikit-learn apres joblib.load."""
+    for est in _iter_all_estimators(modele):
+        cls = type(est)
+        cls_name = cls.__name__
+        if not hasattr(est, "__dict__"):
+            continue
+        try:
+            sig = inspect.signature(cls.__init__)
+            for param_name, param in sig.parameters.items():
+                if param_name == "self":
+                    continue
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    continue
+                if param.default is inspect.Parameter.empty:
+                    continue
+                if not hasattr(est, param_name):
+                    try:
+                        setattr(est, param_name, param.default)
+                    except Exception:
+                        pass
+        except (ValueError, TypeError):
+            pass
+
+        if cls_name == "LogisticRegression" and not hasattr(est, "multi_class"):
+            try:
+                est.multi_class = "auto"
+            except Exception:
+                pass
+        if cls_name == "OneHotEncoder":
+            if hasattr(est, "sparse_output") and not hasattr(est, "sparse"):
+                try:
+                    est.sparse = est.sparse_output
+                except Exception:
+                    pass
+            elif hasattr(est, "sparse") and not hasattr(est, "sparse_output"):
+                try:
+                    est.sparse_output = est.sparse
+                except Exception:
+                    pass
+        if cls_name == "SimpleImputer" and not hasattr(est, "_fill_dtype"):
+            stats = getattr(est, "statistics_", None)
+            if stats is not None and hasattr(stats, "dtype"):
+                try:
+                    est._fill_dtype = stats.dtype
+                except Exception:
+                    pass
+        if any(
+            k in cls_name
+            for k in ("Tree", "Forest", "GradientBoosting", "ExtraTrees", "HistGradientBoosting")
+        ) and not hasattr(est, "monotonic_cst"):
+            try:
+                est.monotonic_cst = None
+            except Exception:
+                pass
+    return modele
+
+
 @st.cache_resource(show_spinner=False)
 def charge_modele_correction() -> object:
     """Charge le modèle exactement tel qu'entraîné par le notebook de correction."""
@@ -84,7 +198,7 @@ def charge_modele_correction() -> object:
             f"{MODELE_DEFAUT.name} est absent du dossier models/ de l'application."
         )
         st.stop()
-    return joblib.load(MODELE_DEFAUT)
+    return _harmonize_loaded_model(joblib.load(MODELE_DEFAUT))
 
 
 def valide_modele(modele: object) -> tuple[bool, str]:
@@ -139,7 +253,7 @@ with st.sidebar:
     )
     if depot is not None:
         try:
-            candidat = joblib.load(io.BytesIO(depot.getvalue()))
+            candidat = _harmonize_loaded_model(joblib.load(io.BytesIO(depot.getvalue())))
         except Exception as exc:  # noqa: BLE001
             st.error(f"Chargement impossible : {exc}")
         else:
